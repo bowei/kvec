@@ -1,0 +1,437 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+\usepackage{amsmath}
+
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{\code{kv} and \code{pred}}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\code{kv} is a read-optimized key/value set with a hash signature that answers
+subset queries without touching the elements. \code{pred} builds on it: a
+label-selector style predicate that is compiled once and matched many times.
+Both trade construction cost for match cost, on the assumption that a set or a
+predicate is built once and queried repeatedly. They live at
+\code{github.com/bowei/kvec/pkg/kv} and \code{github.com/bowei/kvec/pkg/pred}.
+\end{abstract}
+
+\section{\code{kv}}
+
+\subsection{Public interface}
+
+\paragraph{\code{KV}} An immutable set of unique key/value pairs.
+
+\begin{description}
+  \item[\code{New(itr func(yield func(k, v string) bool), cap int) *KV}]
+    builds a \code{KV} from an iterator over pairs. Keys are assumed unique;
+    the constructor does not deduplicate. \code{cap} is a capacity hint equal to
+    the expected number of pairs.
+  \item[\code{(*KV) Len() int}] the number of pairs.
+  \item[\code{(*KV) Equal(other *KV) bool}] whether both sides hold exactly the
+    same pairs.
+  \item[\code{(*KV) Contains(other *KV) bool}] whether every pair of
+    \code{other} is also in the receiver, i.e.\ whether \code{other} is a subset.
+  \item[\code{(*KV) ContainsKeys(keys ...string) bool}] whether the receiver
+    holds a pair for every named key, whatever the value. No keys is vacuously
+    true; duplicate keys are checked more than once.
+  \item[\code{(*KV) Get(key string) (string, bool)}] the value for a key, and
+    whether such a pair exists.
+\end{description}
+
+\paragraph{\code{Signature}} A standalone, dynamically sized approximation of
+set containment over plain strings.
+
+\begin{description}
+  \item[\code{NewSignature(bitWidth uint, keys ...string) *Signature}] rounds
+    \code{bitWidth} up to a power of two, minimum $64$, and sets one bit per
+    key. Duplicate keys are harmless. Panics above $2^{24}$ bits.
+  \item[\code{(*Signature) BitWidth() uint}] the width actually allocated.
+  \item[\code{(*Signature) Contains(other *Signature) bool}] whether every bit
+    of \code{other} is set in the receiver. Panics on mismatched widths, since
+    no answer would preserve the one-sided guarantee below.
+  \item[\code{(*Signature) Equal(other *Signature) bool}] same width, same bits.
+\end{description}
+
+The guarantee is one-sided. For string sets $A, B$ with signatures $S_A, S_B$:
+\[
+  A \supseteq B \implies S_A.\mathrm{Contains}(S_B),
+\]
+but the converse does not hold, as distinct keys can fold onto the same bit. A
+signature therefore rejects with certainty and accepts only provisionally.
+
+\subsection{Internal optimizations}
+
+\paragraph{Fixed-width signatures as a rejection gate.} Every \code{KV} carries
+two \code{sigLen}$\,\times\,64$-bit vectors built at construction: \code{ksig}
+over the key hashes, and \code{kvsig} over the key hashes mixed with the value
+hashes. \code{Contains} tests \code{other}'s bits against the receiver's with
+\code{\&\^{}}; any bit present in \code{other} and absent in the receiver proves
+a pair the receiver cannot hold, and rejects before a single element is read.
+Both vectors are checked. This is not redundant: the two fold different hashes
+into the same width, so a pair missing from one can collide in the other, and at
+\code{sigLen}${}=2$ both vectors sit in the cache line already fetched. The
+fixed width lets the loops be unrolled and keeps the vector inline in the
+struct, where the dynamic \code{Signature} would cost an allocation and an
+unrollable loop.
+
+\paragraph{Hash-ordered storage.} Pairs are sorted once at construction by
+\code{kvCmp}, which orders on the 64-bit FNV-1a hash of the key and breaks ties
+on the key itself so the order is total. Hash order makes the sort key an
+integer comparison in the common case, and the totality is what \code{Equal},
+\code{Contains}, \code{ContainsKeys} and \code{Get} all rely on for their merge
+and binary searches.
+
+\paragraph{Galloping merge in \code{Contains}.} Both sides being sorted, the
+subset test is a single merge pass. A pure merge costs a comparison per element
+of the larger side, which is wasteful when the receiver is much larger than
+\code{other}. The merge therefore counts consecutive skipped elements, and once
+the run reaches \code{gallopAfter} ($=4$) it switches to a binary search over
+the remaining tail. The threshold is the point at which the walk has already
+cost about what $\log_2$ comparisons would, so the search never loses by much
+and wins outright on longer runs. The check sits inside the skip branch rather
+than at the top of the loop, so a merge of two similar sets --- which never
+builds a run that long --- does not pay for it. The pass also aborts early
+whenever more elements remain in \code{other} than in the receiver.
+
+\paragraph{Per-probe signature gate.} \code{ContainsKeys} and \code{Get} build a
+one-bit signature for the probe key and test it against \code{ksig} before
+searching. A missing key is usually rejected on a bit operation instead of a
+binary search.
+
+\paragraph{Allocation-free hashing.} \code{fnv1a64} is written out inline rather
+than through \code{hash.Hash}, avoiding the hash-object allocation on a path
+taken once per key at construction and once per probe at query time.
+
+\paragraph{Power-of-two widths.} Both signature types require a power-of-two bit
+width, so folding a hash to a bit offset is a mask (\code{hash \& bitMask})
+rather than a division. \code{Signature.Contains} reslices the other side to the
+receiver's length so the bounds-check eliminator can drop the checks in the
+loop body.
+
+\section{\code{pred}}
+
+\subsection{Public interface}
+
+\paragraph{\code{PredicateBuilder}} accumulates terms; each method returns the
+receiver so calls chain.
+
+\begingroup\sloppy
+\begin{description}
+  \item[\code{NewPredicateBuilder() *PredicateBuilder}] an empty builder.
+  \item[\code{Key(keys ...string)}] each key must be present, whatever its value.
+  \item[\code{NoKey(keys ...string)}] none of the keys may be present.
+  \item[\code{Has(kv map[string]string)}] each key must be present with the
+    given value. A later call overwrites an earlier one on the same key.
+  \item[\code{ValueIn(key string, values []string)}] the key must be present
+    with a value drawn from \code{values}. An empty \code{values} makes the
+    predicate unsatisfiable.
+  \item[\code{ValueNotIn(key string, values []string)}] the key must be absent,
+    or present with a value outside \code{values}.
+  \item[\code{Build() *Predicate}] compiles the accumulated terms. The result is
+    independent of the builder, and \code{Build} may be called more than once.
+\end{description}
+\endgroup
+
+\paragraph{\code{Predicate}} is the compiled, immutable conjunction of those
+terms. \code{(*Predicate) Match(kv *kv.KV) bool} reports whether a \code{KV}
+satisfies every term; a predicate built from an empty builder matches
+everything. Being immutable, one \code{Predicate} can be matched against many
+\code{KV}s from many goroutines.
+
+\begin{verbatim}
+p := NewPredicateBuilder().
+    Key("app").
+    NoKey("deprecated").
+    Has(map[string]string{"tier": "backend"}).
+    ValueIn("env", []string{"prod", "staging"}).
+    Build()
+\end{verbatim}
+
+\subsection{Internal optimizations}
+
+The builder stores terms as given and does no analysis. All of it happens once,
+in \code{Build}, so that \code{Match} does the least possible work per candidate.
+
+\paragraph{Merging repeated terms.} Repeated \code{ValueIn} terms on one key are
+intersected and repeated \code{ValueNotIn} terms are unioned, so a key costs one
+lookup at match time however many times it was named.
+
+\paragraph{Subsumption.} A term that settles a key's value makes weaker terms on
+that key dead, and they are dropped:
+\begin{itemize}
+  \item an equality decides both value tests on its key at build time, and makes
+    a \code{Key} on it redundant;
+  \item an in-set absorbs an exclusion on the same key by subtracting it, and
+    itself proves the key present, so a \code{Key} on it is also dropped;
+  \item a \code{NoKey} satisfies an exclusion on the same key vacuously, so the
+    exclusion is dropped.
+\end{itemize}
+
+\paragraph{Demotion to equality.} An in-set reduced to a single value is
+rewritten as an equality. That moves it behind the signature gate of
+\code{kv.KV.Contains}, turning a lookup into part of a bit test.
+
+\paragraph{Batched equalities.} All pinned pairs are compiled into one
+\code{kv.KV}, so the whole group is tested by a single \code{Contains} rather
+than a lookup per pair --- and rejected on two words of signature in the common
+case.
+
+\paragraph{Contradictions resolved once.} Conflicts between terms (an equality
+outside its in-set, an in-set emptied by subtraction, a key required both
+present and absent) are found at build time and recorded in a single
+\code{unsatisfiable} flag, so \code{Match} returns on one boolean.
+
+\paragraph{Cheapest-first evaluation.} \code{Match} orders its terms by cost:
+the equality set first, since its signature gate rejects the whole group without
+a lookup and it is the only test that can reject on a wrong value rather than a
+missing key; then the existence tests, each usually rejecting on a signature bit
+alone; then the value tests, which always pay for a lookup.
+
+\paragraph{\code{sortedset}.} Value sets are sorted and deduplicated at build
+time, which both shrinks them and enables searching. \code{contains} scans
+linearly up to \code{linearScanMax} ($=8$) elements, where locality and branch
+prediction beat the $\log_2 n$ comparisons of a binary search, and binary
+searches above it. \code{intersect}, \code{union} and \code{subtract} are single
+linear merges over the sorted representation.
+
+\paragraph{Deterministic layout.} The per-key sets are flattened into slices
+ordered by key, so a compiled \code{Predicate} does not depend on map iteration
+order and matches in a stable, cache-friendly sequence.
+
+\section{Benchmark results}
+
+All numbers below were measured on an Apple M3 under \code{go1.25.1
+darwin/arm64} with \code{go test -bench . -benchmem -count 5}; each figure is
+the median of the five runs, in nanoseconds per operation. Run-to-run spread was
+at most $5\%$ of the median, and under $1\%$ for most figures. Every
+operation on the query path allocates nothing: only \code{Build} appears with a
+non-zero allocation count.
+
+\subsection{\code{kv.KV}}
+
+Table~\ref{tab:kv} is a 64-pair set. The pattern the design is built around
+shows up directly: a miss is more than an order of magnitude cheaper than a hit,
+because the signature answers it without reaching the elements.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrl}
+\hline
+Operation & ns/op & Path taken \\
+\hline
+\code{Contains} hit (2 pairs)      &  48.6 & merge, then compare values \\
+\code{Contains} miss (2 pairs)     &   1.4 & rejected on \code{kvsig} \\
+\code{ContainsKeys} hit            &  32.3 & signature passes, binary search \\
+\code{ContainsKeys} miss           &   6.0 & rejected on \code{ksig} \\
+\code{ContainsKeys} 4 keys, all hit & 129.4 & four searches \\
+\code{ContainsKeys} 5 keys, last misses & 133.1 & four searches, then reject \\
+\hline
+\end{tabular}
+\caption{\code{KV} operations against a 64-pair set.}
+\label{tab:kv}
+\end{table}
+
+\subsection{\code{Contains} across sizes}
+
+Table~\ref{tab:pairwise} times \code{Contains} for every pair of set sizes. At
+these sizes both signatures are saturated on both sides, so they never reject:
+this is the case where the merge has to do the work.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrr}
+\hline
+ & \multicolumn{4}{c}{\code{other}} \\
+receiver & 1k & 10k & 100k & 1M \\
+\hline
+1k   &      4\,667 &     1.7 &      1.8 &      1.8 \\
+10k  &      6\,451 & 47\,745 &      1.7 &      1.7 \\
+100k &      8\,180 & 101\,523 & 470\,658 &      1.8 \\
+1M   &     16\,218 & 188\,793 & 2\,907\,257 & 4\,704\,127 \\
+\hline
+\end{tabular}
+\caption{\code{Contains} in ns/op. Below the diagonal the call is a genuine hit
+that runs the merge to completion; above it the receiver is the smaller set and
+the call exits on the length check.}
+\label{tab:pairwise}
+\end{table}
+
+Two things are worth reading off it. First, the upper triangle is flat at
+$1.7$--$1.8$\,ns: a set that cannot possibly be a superset is rejected in
+constant time, whatever the sizes involved. Second, the lower triangle is where
+the gallop earns its keep. Probing 1k pairs into a 1M-pair set costs
+$16.2\,\mu$s, about $16$\,ns per probe --- the cost of a binary search each.
+Walking that set instead would cost roughly what the 1M/1M cell costs,
+$4.7$\,ms, so on this shape the gallop is around $290\times$ ahead. The
+diagonal, where the two sides are the same size and the gallop never triggers,
+runs at about $4.7$\,ns per pair.
+
+\subsection{\code{kv.Signature}}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrr}
+\hline
+ & 64 bits & 1024 bits & 65536 bits \\
+\hline
+hit  & 1.9 & 6.4 & 283.8 \\
+miss & 1.4 & 2.9 &  92.4 \\
+\hline
+\end{tabular}
+\caption{\code{Signature.Contains} in ns/op, 64 keys in the receiver.}
+\label{tab:sig}
+\end{table}
+
+Cost is linear in the number of words, since a hit has to read all of them; a
+miss is cheaper because the loop returns at the first word that fails. This is
+the argument for the inline fixed-width signature inside \code{KV}: at
+\code{sigLen}${}=2$ the whole test is the $1.4$--$1.9$\,ns line of
+Table~\ref{tab:sig}, with no allocation and no loop.
+
+\subsection{Where the signature gate stops paying}
+
+The gate is only worth what it rejects, and what it rejects decays as the set
+fills it. A \code{KV} carries $64 \times \code{sigLen} = 128$ bits, so a set of
+$n$ keys leaves a fraction of about
+\[
+  \left(1 - \frac{1}{128}\right)^{n}
+\]
+of them clear, and only an absent key landing on a clear bit is rejected without
+a search. Table~\ref{tab:sat} measures both the rate and its cost. The share is
+counted over 4096 absent keys; the timing rotates through 64 of them, so each
+figure averages over the gate firing and not firing rather than depending on
+whether one chosen key happens to collide.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrrrrr}
+\hline
+pairs in the set & 8 & 16 & 32 & 64 & 128 & 256 & 1024 \\
+\hline
+absent keys rejected by \code{ksig} & 92.9\% & 87.2\% & 75.3\% & 64.5\% & 31.2\% & 13.9\% & 0.0\% \\
+predicted by the formula            & 93.9\% & 88.2\% & 77.8\% & 60.5\% & 36.6\% & 13.4\% & 0.0\% \\
+\code{ContainsKeys} miss, ns/op     & 12.8 & 13.5 & 14.7 & 16.4 & 30.5 & 43.3 & 50.6 \\
+\hline
+\end{tabular}
+\caption{Decay of the fixed signature as the set grows. Measured rates track the
+formula to within a few points.}
+\label{tab:sat}
+\end{table}
+
+The cost of a missing key rises from $12.8$ to $50.6$\,ns as the gate goes from
+rejecting almost everything to rejecting nothing, at which point every probe
+pays for the binary search the signature exists to avoid. This is the
+quantitative form of the note in the source that \code{sigLen} suits sets of far
+fewer than a thousand pairs: the gate is worth having up to a hundred or so
+pairs, is half wasted by $128$, and is dead weight by $1024$. A set expected to
+run large wants a larger \code{sigLen}, at two words of overhead per doubling.
+
+Note that the single figure in Table~\ref{tab:kv} --- a $6.0$\,ns
+\code{ContainsKeys} miss at 64 pairs --- is one key that happened to land on a
+clear bit. Table~\ref{tab:sat} gives the honest average for that size, $16.4$\,ns.
+
+\subsection{\code{pred}}
+
+\code{Match} checks its terms cheapest-first, so a single ``miss'' figure would
+say nothing: it would report whichever term the input happened to break.
+Table~\ref{tab:match} instead breaks a different term in each column, in the
+order \code{Match} tries them.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llrrr}
+\hline
+\multicolumn{2}{l}{rejected on} & \multicolumn{3}{c}{\code{KV} size} \\
+term & broken by & 8 & 16 & 64 \\
+\hline
+\code{eq}         & key absent        &   2.4 &   2.4 &   2.4 \\
+\code{eq}         & wrong value       &   2.4 &   2.4 &   2.4 \\
+\code{keyExists}  & required key gone  &  45.2 &  66.7 &  77.9 \\
+\code{keyNExists} & forbidden key present &  93.8 & 104.1 & 122.5 \\
+\code{in}         & value outside the set &  91.2 & 103.9 & 120.9 \\
+\code{notIn}      & value inside the set & 116.4 & 132.7 & 155.6 \\
+\hline
+\multicolumn{2}{l}{accepted (all terms pass)} & 117.1 & 133.3 & 157.2 \\
+\multicolumn{2}{l}{unsatisfiable predicate}   & \multicolumn{3}{c}{1.9} \\
+\hline
+\end{tabular}
+\caption{\code{Match} in ns/op, for a five-term predicate naming one term of
+every kind.}
+\label{tab:match}
+\end{table}
+
+The spread is the result. A candidate rejected on the equality set costs
+$2.4$\,ns whatever its size, against $157.2$\,ns for one that passes every term
+--- a factor of $65$ between the cheapest and dearest outcome of the same call.
+Ordering the terms is worth that factor only because the cheap tests are also
+the ones most likely to fire: a selector applied across a population rejects
+most of it, and rejects most of that on a pinned pair.
+
+Three details are worth reading carefully.
+
+\begin{itemize}
+  \item A wrong value costs exactly what an absent key costs, $2.4$\,ns. The
+    \code{eq} test is not a lookup that happens to fail early --- \code{kvsig}
+    folds the value into the bit, so a pair with the right key and the wrong
+    value misses the signature just as a missing key does.
+  \item The rows are not a strict ladder, and cannot be: breaking a term also
+    changes what the earlier terms do. Rejecting on \code{keyNExists} requires
+    the forbidden key to be \emph{present}, which turns the lookup that rejects
+    into a hit rather than a signature miss, and that is why it costs about what
+    the later \code{in} row costs. Each row is the true cost of that outcome,
+    but the rows are not a decomposition of one call.
+  \item Everything on this path is allocation-free at every size.
+\end{itemize}
+
+\code{Build} costs $953.9$\,ns and $1584$\,B in $30$ allocations for this
+predicate. That is the bet of the package as a number: against the $157.2$\,ns
+accept, it pays for itself after about six matches, and against the $2.4$\,ns
+reject, after roughly four hundred. Either way a predicate matched across a
+population of any size has long since repaid it.
+
+The same five terms written so that two of them are redundant --- a \code{Key}
+and a \code{ValueNotIn} on a key that an equality already settles --- build in
+$837.0$\,ns and $25$ allocations, and compile to three terms rather than five.
+The redundant form is both cheaper to build and cheaper to match, since the work
+it names is discarded rather than performed once per candidate.
+
+\subsection{Why the equality set is one \code{Contains}}
+
+\code{BenchmarkEqStrategy} compares the two ways of testing three pinned pairs:
+the single \code{Contains} that \code{Match} uses, against the lookup-per-pair
+it replaced.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llrrr}
+\hline
+ & \code{KV} size & 8 & 16 & 64 \\
+\hline
+hit  & \code{Contains}  & 41.8 & 47.2 & 55.3 \\
+     & per-pair lookup  & 99.0 & 109.0 & 130.6 \\
+\hline
+miss & \code{Contains}  &  1.9 &  1.9 &  1.9 \\
+     & per-pair lookup  & 83.9 & 92.6 & 109.0 \\
+\hline
+\end{tabular}
+\caption{Testing three pinned pairs, in ns/op.}
+\label{tab:eq}
+\end{table}
+
+\code{Contains} is $2.3$--$2.4\times$ faster on a hit, where it makes one merge
+pass instead of three independent searches. On a miss it is $45$--$58\times$
+faster,
+and --- more to the point --- flat at $1.9$\,ns across every size, where the
+lookup form grows with the candidate. That flat line is the $2.4$\,ns
+\code{eq} row of Table~\ref{tab:match} seen on its own, and it is the reason
+\code{Build} folds every equality into a single \code{kv.KV} and \code{Match}
+tests it first.
+
+\end{document}
