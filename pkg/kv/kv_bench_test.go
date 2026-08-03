@@ -150,3 +150,19 @@ func BenchmarkContainsKeysSaturation(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkHash times the fold over the whole set. There is no early exit to
+// measure: Hash always walks every pair.
+func BenchmarkHash(b *testing.B) {
+	for _, size := range benchSizes {
+		s := benchSet(size.n)
+		b.Run(size.name, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				sink = s.Hash()
+			}
+		})
+	}
+}
+
+// sink keeps the compiler from folding away the benchmarked call.
+var sink uint64

@@ -178,6 +178,22 @@ func (s *KV) Get(key string) (string, bool) {
 	return s.kvs[i].v, true
 }
 
+// Hash is a hash representation of the keys and values. Equal KVs hash equal.
+// The converse does not hold: 64 bits cannot separate every pair of distinct
+// contents.
+func (s *KV) Hash() uint64 {
+	hash := uint64(fnvOffsetBasis64)
+	for _, e := range s.kvs {
+		// khash is a fixed eight bytes and so delimits itself. The value is
+		// length-prefixed, without which its bytes could run into the next
+		// pair and give two different sets the same stream of bytes to fold.
+		hash = fnv1a64AddWord(hash, e.khash)
+		hash = fnv1a64AddWord(hash, uint64(len(e.v)))
+		hash = fnv1a64Add(hash, []byte(e.v))
+	}
+	return hash
+}
+
 type kv struct {
 	khash uint64
 
@@ -229,10 +245,27 @@ const (
 
 // fnv1a64 inline avoids allocation of a hash object.
 func fnv1a64(data []byte) uint64 {
-	hash := uint64(fnvOffsetBasis64)
+	return fnv1a64Add(fnvOffsetBasis64, data)
+}
+
+// fnv1a64Add continues the hash over more data.
+func fnv1a64Add(hash uint64, data []byte) uint64 {
 	for i := range data {
 		hash ^= uint64(data[i])
 		hash *= fnvPrime64
+	}
+	return hash
+}
+
+// fnv1a64AddWord continues the hash over the eight bytes of x, least
+// significant byte first. Folding the whole word rather than mixing x in
+// directly keeps the result a plain fnv1a64 over a byte stream, which is what
+// makes the length prefixes in Hash mean anything.
+func fnv1a64AddWord(hash, x uint64) uint64 {
+	for range 8 {
+		hash ^= x & 0xff
+		hash *= fnvPrime64
+		x >>= 8
 	}
 	return hash
 }

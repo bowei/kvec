@@ -329,6 +329,57 @@ func TestContainsKeysRandom(t *testing.T) {
 	}
 }
 
+func TestHash(t *testing.T) {
+	a := newKV("a", "1", "b", "2")
+	for _, tc := range []struct {
+		name string
+		b    *KV
+		want bool
+	}{
+		{"same order", newKV("a", "1", "b", "2"), true},
+		{"other order", newKV("b", "2", "a", "1"), true},
+		{"different value", newKV("a", "1", "b", "3"), false},
+		{"different key", newKV("a", "1", "c", "2"), false},
+		{"swapped values", newKV("a", "2", "b", "1"), false},
+		{"key and value swapped", newKV("1", "a", "2", "b"), false},
+		{"subset", newKV("a", "1"), false},
+		{"superset", newKV("a", "1", "b", "2", "c", "3"), false},
+		{"empty", newKV(), false},
+		// The length prefix keeps a value from running into the next pair.
+		{"value split across the pairs", newKV("a", "1b", "b", "2"), false},
+	} {
+		if got := a.Hash() == tc.b.Hash(); got != tc.want {
+			t.Errorf("%s: %s.Hash() = %#x, %s.Hash() = %#x, want equal = %t",
+				tc.name, dump(a), a.Hash(), dump(tc.b), tc.b.Hash(), tc.want)
+		}
+	}
+	// The zero KV and the empty one hold the same pairs, so they hash alike.
+	var zero KV
+	if got, want := zero.Hash(), newKV().Hash(); got != want {
+		t.Errorf("zero KV Hash() = %#x, empty KV Hash() = %#x, want equal", got, want)
+	}
+}
+
+// TestHashRandom checks the guarantee Hash actually makes: Equal sets hash
+// equal. Unequal sets are only expected to hash apart, which is checked here as
+// well because the inputs are small enough that a collision means a mistake in
+// the folding rather than the 64-bit birthday bound.
+func TestHashRandom(t *testing.T) {
+	next := randMaps(4)
+	for i := 0; i < 10000; i++ {
+		am, bm := next(), next()
+		a, b := fromMap(am), fromMap(bm)
+		want := a.Equal(b)
+		if got := a.Hash() == b.Hash(); got != want {
+			t.Fatalf("%v.Hash() = %#x, %v.Hash() = %#x, want equal = %t", am, a.Hash(), bm, b.Hash(), want)
+		}
+		// The order the pairs were yielded in does not reach the hash.
+		if got, want := fromMap(am).Hash(), a.Hash(); got != want {
+			t.Fatalf("%v.Hash() = %#x on a rebuild, want %#x", am, got, want)
+		}
+	}
+}
+
 func TestSignatureIsOrderIndependent(t *testing.T) {
 	a := newKV("a", "1", "b", "2", "c", "3")
 	b := newKV("c", "3", "b", "2", "a", "1")
