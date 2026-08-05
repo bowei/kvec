@@ -32,8 +32,8 @@ func New(itr func(yield func(k, v string) bool), cap int) *KV {
 // KV is an optimized key/value structure for Contains and ContainsKeys
 // operations.
 type KV struct {
-	ksig  sig.Fixed
-	kvsig sig.Fixed
+	ksig  sig.Fixed128
+	kvsig sig.Fixed128
 
 	// kvs are sorted by hash order.
 	kvs []kv
@@ -149,7 +149,7 @@ func (s *KV) ContainsKeys(keys ...string) bool {
 		probe := makeKV(key, "")
 
 		// The key's bit is missing from the signature, so no pair in s has it.
-		var probeSig sig.Fixed
+		var probeSig sig.Fixed128
 		probeSig.Set(probe.kbit())
 		if !s.ksig.Contains(probeSig) {
 			return false
@@ -168,7 +168,7 @@ func (s *KV) Get(key string) (string, bool) {
 	probe := makeKV(key, "")
 
 	// The key's bit is missing from the signature, so no pair in s has it.
-	var probeSig sig.Fixed
+	var probeSig sig.Fixed128
 	probeSig.Set(probe.kbit())
 	if !s.ksig.Contains(probeSig) {
 		return "", false
@@ -227,8 +227,8 @@ func kvCmp(a, b kv) int {
 }
 
 // bitMask compresses the hash to a bit offset that fits in the signature.
-// sig.FixedBits is a power of two, so the low bits address the vector exactly.
-const bitMask uint64 = sig.FixedBits - 1
+// sig.Fixed128Bits is a power of two, so the low bits address the vector exactly.
+const bitMask uint64 = sig.Fixed128Bits - 1
 
 func (x kv) kbit() uint {
 	return uint(x.khash & bitMask)

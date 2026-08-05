@@ -57,10 +57,10 @@ func TestNew(t *testing.T) {
 	if !slices.IsSortedFunc(s.kvs, kvCmp) {
 		t.Errorf("kvs = %v, want sorted by kvCmp", s.kvs)
 	}
-	if (s.ksig == sig.Fixed{}) {
+	if (s.ksig == sig.Fixed128{}) {
 		t.Errorf("ksig = 0, want non-zero")
 	}
-	if (s.kvsig == sig.Fixed{}) {
+	if (s.kvsig == sig.Fixed128{}) {
 		t.Errorf("kvsig = 0, want non-zero")
 	}
 }
@@ -91,7 +91,7 @@ func TestEmpty(t *testing.T) {
 		if got := s.Len(); got != 0 {
 			t.Errorf("%s.Len() = %d, want 0", dump(s), got)
 		}
-		if (s.ksig != sig.Fixed{}) || (s.kvsig != sig.Fixed{}) {
+		if (s.ksig != sig.Fixed128{}) || (s.kvsig != sig.Fixed128{}) {
 			t.Errorf("%s has non-zero signatures %#x %#x", dump(s), s.ksig, s.kvsig)
 		}
 		if !s.Contains(&zero) || !s.Contains(empty) {

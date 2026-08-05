@@ -180,17 +180,18 @@ func BenchmarkSignatureSet(b *testing.B) {
 	}
 }
 
-// BenchmarkSignatureVsFixed puts Signature against Fixed at the one width they
-// share, which is the comparison behind the advice to prefer Fixed where the
-// width is known and small. Signature pays an indirection through the slice
-// header and a loop the compiler cannot unroll; Fixed pays neither.
+// BenchmarkSignatureVsFixed puts Signature against Fixed128 at the one width
+// they share, which is the comparison behind the advice to prefer a fixed
+// vector where the width is known and small. Signature pays an indirection
+// through the slice header and a loop the compiler cannot unroll; Fixed128 pays
+// neither.
 func BenchmarkSignatureVsFixed(b *testing.B) {
-	const bitWidth = FixedBits
+	const bitWidth = Fixed128Bits
 
 	big := benchSignature(bitWidth, 64)
 	sub := NewSignature(bitWidth, "key-0016", "key-0017")
 
-	var fixedBig, fixedSub Fixed
+	var fixedBig, fixedSub Fixed128
 	copy(fixedBig[:], big.words)
 	copy(fixedSub[:], sub.words)
 

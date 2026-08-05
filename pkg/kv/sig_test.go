@@ -17,10 +17,10 @@ func TestSignatureCoversEveryElement(t *testing.T) {
 		m := next()
 		s := fromMap(m)
 		for _, e := range s.kvs {
-			var kbit, kvbit sig.Fixed
+			var kbit, kvbit sig.Fixed128
 			kbit.Set(e.kbit())
 			kvbit.Set(e.kvbit())
-			if (kbit == sig.Fixed{}) || (kvbit == sig.Fixed{}) {
+			if (kbit == sig.Fixed128{}) || (kvbit == sig.Fixed128{}) {
 				t.Fatalf("%s=%s: set produced an empty signature", e.k, e.v)
 			}
 			if !s.ksig.Contains(kbit) {
@@ -37,14 +37,14 @@ func TestSignatureCoversEveryElement(t *testing.T) {
 // offset it can produce must set a bit, and between them they must cover the
 // whole signature.
 func TestSignatureBitsAreReachable(t *testing.T) {
-	var all, want sig.Fixed
+	var all, want sig.Fixed128
 	for i := range want {
 		want[i] = ^uint64(0)
 	}
 	for bit := uint(0); bit <= uint(bitMask); bit++ {
-		var s sig.Fixed
+		var s sig.Fixed128
 		s.Set(bit)
-		if (s == sig.Fixed{}) {
+		if (s == sig.Fixed128{}) {
 			t.Fatalf("Set(%d) set no bit: bitMask is wider than the signature", bit)
 		}
 		for i := range all {
@@ -71,7 +71,7 @@ func TestSignatureRejectionRate(t *testing.T) {
 		set := benchSet(n)
 		rejected := 0
 		for _, p := range probes {
-			var probeSig sig.Fixed
+			var probeSig sig.Fixed128
 			probeSig.Set(makeKV(p, "").kbit())
 			if !set.ksig.Contains(probeSig) {
 				rejected++
@@ -79,7 +79,7 @@ func TestSignatureRejectionRate(t *testing.T) {
 		}
 		rate := float64(rejected) / float64(len(probes))
 		t.Logf("n=%4d: ksig rejects %5.1f%% of absent keys (expected %5.1f%%)",
-			n, 100*rate, 100*math.Pow(1-1/float64(sig.FixedBits), float64(n)))
+			n, 100*rate, 100*math.Pow(1-1/float64(sig.Fixed128Bits), float64(n)))
 		if rate > prev {
 			t.Errorf("n=%d: rejection rate %.3f rose above %.3f; the gate should only decay as the set fills", n, rate, prev)
 		}

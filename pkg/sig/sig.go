@@ -3,9 +3,9 @@
 // a subset" exactly and "other may be a subset" approximately, which makes it a
 // cheap gate in front of an exact check.
 //
-// Fixed is sized at compile time and lives inline in the caller's struct.
-// Signature is sized per instance, at the cost of an allocation and a loop the
-// compiler cannot unroll.
+// Fixed64, Fixed128 and Fixed256 are sized at compile time and live inline in
+// the caller's struct. Signature is sized per instance, at the cost of an
+// allocation and a loop the compiler cannot unroll.
 package sig
 
 import (
@@ -69,10 +69,10 @@ func sigBits(bitWidth uint) uint {
 //
 // Signature.Contains can only be peformed on equal bitwidths.
 //
-// This is the dynamically sized counterpart of Fixed: the width is chosen
-// per instance rather than at compile time, at the cost of an allocation and a
-// loop that the compiler cannot unroll. Prefer Fixed where the width is
-// known and small.
+// This is the dynamically sized counterpart of Fixed64/Fixed128/Fixed256: the
+// width is chosen per instance rather than at compile time, at the cost of an
+// allocation and a loop that the compiler cannot unroll. Prefer a fixed vector
+// where the width is known and small.
 //
 // The zero Signature is an empty signature of width zero. It contains only
 // other zero Signatures, and comparing it against a constructed one panics, so
