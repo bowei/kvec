@@ -82,10 +82,6 @@ func (b *PredicateBuilder) ValueNotIn(key string, values []string) *PredicateBui
 // immutable; the same Predicate can be matched against many KVs, from many
 // goroutines.
 type Predicate struct {
-	// unsatisfiable records that the terms contradict each other, so no KV can
-	// match and the rest of the struct is unset.
-	unsatisfiable bool
-
 	// eq holds every pinned key/value pair as a KV, so that the whole set is
 	// tested by one Contains rather than a lookup per pair. Nil if there are
 	// none.
@@ -99,6 +95,10 @@ type Predicate struct {
 	// in and notIn hold at most one entry per key, sorted by key.
 	in    []valueSet
 	notIn []valueSet
+
+	// unsatisfiable records that the terms contradict each other, so no KV can
+	// match and the rest of the struct is unset.
+	unsatisfiable bool
 }
 
 // valueSet is a key tested against a set of values.

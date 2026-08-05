@@ -119,8 +119,8 @@ func BenchmarkContainsKeys(b *testing.B) {
 }
 
 // BenchmarkContainsKeysSaturation measures the signature gate as the set fills
-// it. A KV carries 64*sigLen bits, so a set of n keys leaves about
-// (1-1/(64*sigLen))^n of them clear, and only a probe landing on a clear bit is
+// it. A KV carries sig.FixedBits bits, so a set of n keys leaves about
+// (1-1/sig.FixedBits)^n of them clear, and only a probe landing on a clear bit is
 // rejected without a search. The gate therefore decays as n grows, and the cost
 // of a missing key rises from a bit test towards the binary search it was meant
 // to save.

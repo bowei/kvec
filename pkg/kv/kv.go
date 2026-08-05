@@ -3,6 +3,9 @@ package kv
 import (
 	"slices"
 	"strings"
+
+	"github.com/bowei/kvec/pkg/fnv"
+	"github.com/bowei/kvec/pkg/sig"
 )
 
 // New creates a new KV from an iterator over the keys and values.
@@ -20,8 +23,8 @@ func New(itr func(yield func(k, v string) bool), cap int) *KV {
 	slices.SortFunc(fkv.kvs, kvCmp)
 
 	for _, e := range fkv.kvs {
-		fkv.ksig.set(e.kbit())
-		fkv.kvsig.set(e.kvbit())
+		fkv.ksig.Set(e.kbit())
+		fkv.kvsig.Set(e.kvbit())
 	}
 	return &fkv
 }
@@ -29,8 +32,8 @@ func New(itr func(yield func(k, v string) bool), cap int) *KV {
 // KV is an optimized key/value structure for Contains and ContainsKeys
 // operations.
 type KV struct {
-	ksig  fixedSignature
-	kvsig fixedSignature
+	ksig  sig.Fixed
+	kvsig sig.Fixed
 
 	// kvs are sorted by hash order.
 	kvs []kv
@@ -40,7 +43,7 @@ type KV struct {
 func (s *KV) Len() int { return len(s.kvs) }
 
 func (s *KV) Equal(other *KV) bool {
-	if !s.kvsig.equal(other.kvsig) {
+	if !s.kvsig.Equal(other.kvsig) {
 		return false
 	}
 	if len(s.kvs) != len(other.kvs) {
@@ -66,7 +69,7 @@ func (s *KV) Contains(other *KV) bool {
 	// that other holds a pair (or a key) that s cannot hold, so other can be
 	// rejected without looking at any element. The converse does not hold: the
 	// signatures are approximations, so passing proves nothing.
-	if !s.kvsig.contains(other.kvsig) {
+	if !s.kvsig.Contains(other.kvsig) {
 		return false
 	}
 	// Not implied by the kvsig check above: kbit and kvbit fold different
@@ -75,7 +78,7 @@ func (s *KV) Contains(other *KV) bool {
 	// with a different value leaves ksig alone), but it is a second independent
 	// chance to reject it, and both signatures sit in the same cache line as
 	// the one already read.
-	if !s.ksig.contains(other.ksig) {
+	if !s.ksig.Contains(other.ksig) {
 		return false
 	}
 	if len(other.kvs) > len(s.kvs) {
@@ -146,9 +149,9 @@ func (s *KV) ContainsKeys(keys ...string) bool {
 		probe := makeKV(key, "")
 
 		// The key's bit is missing from the signature, so no pair in s has it.
-		var probeSig fixedSignature
-		probeSig.set(probe.kbit())
-		if !s.ksig.contains(probeSig) {
+		var probeSig sig.Fixed
+		probeSig.Set(probe.kbit())
+		if !s.ksig.Contains(probeSig) {
 			return false
 		}
 
@@ -165,9 +168,9 @@ func (s *KV) Get(key string) (string, bool) {
 	probe := makeKV(key, "")
 
 	// The key's bit is missing from the signature, so no pair in s has it.
-	var probeSig fixedSignature
-	probeSig.set(probe.kbit())
-	if !s.ksig.contains(probeSig) {
+	var probeSig sig.Fixed
+	probeSig.Set(probe.kbit())
+	if !s.ksig.Contains(probeSig) {
 		return "", false
 	}
 
@@ -182,14 +185,14 @@ func (s *KV) Get(key string) (string, bool) {
 // The converse does not hold: 64 bits cannot separate every pair of distinct
 // contents.
 func (s *KV) Hash() uint64 {
-	hash := uint64(fnvOffsetBasis64)
+	hash := fnv.OffsetBasis64
 	for _, e := range s.kvs {
 		// khash is a fixed eight bytes and so delimits itself. The value is
 		// length-prefixed, without which its bytes could run into the next
 		// pair and give two different sets the same stream of bytes to fold.
-		hash = fnv1a64AddWord(hash, e.khash)
-		hash = fnv1a64AddWord(hash, uint64(len(e.v)))
-		hash = fnv1a64Add(hash, []byte(e.v))
+		hash = fnv.AddWord64(hash, e.khash)
+		hash = fnv.AddWord64(hash, uint64(len(e.v)))
+		hash = fnv.Add64(hash, []byte(e.v))
 	}
 	return hash
 }
@@ -203,7 +206,7 @@ type kv struct {
 
 func makeKV(k, v string) kv {
 	return kv{
-		khash: fnv1a64([]byte(k)),
+		khash: fnv.Hash64([]byte(k)),
 		k:     k,
 		v:     v,
 	}
@@ -224,8 +227,8 @@ func kvCmp(a, b kv) int {
 }
 
 // bitMask compresses the hash to a bit offset that fits in the signature.
-// sigLen must be a power of two for this to cover the signature exactly.
-const bitMask uint64 = 64*sigLen - 1
+// sig.FixedBits is a power of two, so the low bits address the vector exactly.
+const bitMask uint64 = sig.FixedBits - 1
 
 func (x kv) kbit() uint {
 	return uint(x.khash & bitMask)
@@ -233,39 +236,7 @@ func (x kv) kbit() uint {
 
 func (x kv) kvbit() uint {
 	hash := x.khash
-	hash ^= fnv1a64([]byte(x.v))
+	hash ^= fnv.Hash64([]byte(x.v))
 	hash &= bitMask
 	return uint(hash)
-}
-
-const (
-	fnvOffsetBasis64 = 14695981039346656037
-	fnvPrime64       = 1099511628211
-)
-
-// fnv1a64 inline avoids allocation of a hash object.
-func fnv1a64(data []byte) uint64 {
-	return fnv1a64Add(fnvOffsetBasis64, data)
-}
-
-// fnv1a64Add continues the hash over more data.
-func fnv1a64Add(hash uint64, data []byte) uint64 {
-	for i := range data {
-		hash ^= uint64(data[i])
-		hash *= fnvPrime64
-	}
-	return hash
-}
-
-// fnv1a64AddWord continues the hash over the eight bytes of x, least
-// significant byte first. Folding the whole word rather than mixing x in
-// directly keeps the result a plain fnv1a64 over a byte stream, which is what
-// makes the length prefixes in Hash mean anything.
-func fnv1a64AddWord(hash, x uint64) uint64 {
-	for range 8 {
-		hash ^= x & 0xff
-		hash *= fnvPrime64
-		x >>= 8
-	}
-	return hash
 }

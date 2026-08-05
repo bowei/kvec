@@ -2,186 +2,87 @@ package kv
 
 import (
 	"fmt"
+	"math"
 	"testing"
+
+	"github.com/bowei/kvec/pkg/sig"
 )
 
-func TestSigBits(t *testing.T) {
-	for _, tc := range []struct {
-		in   uint
-		want uint
-	}{
-		{0, 64},
-		{1, 64},
-		{63, 64},
-		{64, 64},
-		{65, 128},
-		{128, 128},
-		{129, 256},
-		{1000, 1024},
-		{maxSigBits, maxSigBits},
-	} {
-		if got := sigBits(tc.in); got != tc.want {
-			t.Errorf("sigBits(%d) = %d, want %d", tc.in, got, tc.want)
-		}
-	}
-}
-
-func TestNewSignatureWidth(t *testing.T) {
-	for _, bitWidth := range []uint{0, 1, 64, 65, 512, 1000} {
-		sig := NewSignature(bitWidth)
-		want := sigBits(bitWidth)
-		if got := sig.BitWidth(); got != want {
-			t.Errorf("NewSignature(%d).BitWidth() = %d, want %d", bitWidth, got, want)
-		}
-		if got := uint(len(sig.words)) * 64; got != want {
-			t.Errorf("NewSignature(%d) allocated %d bits, want %d", bitWidth, got, want)
-		}
-	}
-}
-
-func TestNewSignatureTooWide(t *testing.T) {
-	defer func() {
-		if recover() == nil {
-			t.Errorf("NewSignature(%d) did not panic", maxSigBits+1)
-		}
-	}()
-	NewSignature(maxSigBits + 1)
-}
-
-func TestSignatureContainsMismatchedWidthPanics(t *testing.T) {
-	defer func() {
-		if recover() == nil {
-			t.Errorf("Contains across widths 64 and 128 did not panic")
-		}
-	}()
-	NewSignature(64, "a").Contains(NewSignature(128, "a"))
-}
-
-func TestSignatureEmpty(t *testing.T) {
-	empty := NewSignature(128)
-	full := NewSignature(128, "a", "b", "c")
-
-	if !full.Contains(empty) {
-		t.Errorf("a non-empty signature does not contain the empty one")
-	}
-	if !empty.Contains(empty) || !empty.Equal(NewSignature(128)) {
-		t.Errorf("the empty signature is not equal to itself")
-	}
-	if empty.Contains(full) {
-		t.Errorf("the empty signature contains a non-empty one")
-	}
-	// The zero value is a valid, if unusable, width-zero signature.
-	var zero Signature
-	if !zero.Contains(&Signature{}) || zero.BitWidth() != 0 {
-		t.Errorf("the zero Signature does not contain itself")
-	}
-}
-
-func TestSignatureOrderAndDuplicates(t *testing.T) {
-	a := NewSignature(256, "a", "b", "c")
-	b := NewSignature(256, "c", "a", "b")
-	c := NewSignature(256, "a", "a", "b", "c", "c", "c")
-	if !a.Equal(b) {
-		t.Errorf("signatures differ by key order")
-	}
-	if !a.Equal(c) {
-		t.Errorf("signatures differ by duplicate keys")
-	}
-	// Width is part of equality, and a wider signature is not comparable at all.
-	if a.Equal(NewSignature(512, "a", "b", "c")) {
-		t.Errorf("signatures of different widths compare equal")
-	}
-}
-
-// TestSignatureCoversEveryKey checks that every key's bit really lands in the
-// vector: a signature must contain the single-key signature of each of its
-// keys.
-func TestSignatureCoversEveryKey(t *testing.T) {
-	keys := []string{"", "a", "b", "carrot", "a-longer-key", "\x00\xff"}
-	for _, bitWidth := range []uint{64, 65, 128, 1000} {
-		sig := NewSignature(bitWidth, keys...)
-		for _, k := range keys {
-			if !sig.Contains(NewSignature(bitWidth, k)) {
-				t.Errorf("width %d: signature of %v is missing key %q", bitWidth, keys, k)
+// TestSignatureCoversEveryElement checks that every element's bit really lands
+// in the signature. A bitMask wider than the signature would silently drop the
+// out-of-range offsets in set, leaving most elements unrepresented.
+func TestSignatureCoversEveryElement(t *testing.T) {
+	next := randMaps(4)
+	for i := 0; i < 1000; i++ {
+		m := next()
+		s := fromMap(m)
+		for _, e := range s.kvs {
+			var kbit, kvbit sig.Fixed
+			kbit.Set(e.kbit())
+			kvbit.Set(e.kvbit())
+			if (kbit == sig.Fixed{}) || (kvbit == sig.Fixed{}) {
+				t.Fatalf("%s=%s: set produced an empty signature", e.k, e.v)
+			}
+			if !s.ksig.Contains(kbit) {
+				t.Fatalf("%v: ksig %#x is missing the bit for key %q", m, s.ksig, e.k)
+			}
+			if !s.kvsig.Contains(kvbit) {
+				t.Fatalf("%v: kvsig %#x is missing the bit for %s=%s", m, s.kvsig, e.k, e.v)
 			}
 		}
 	}
 }
 
-// TestSignatureNoFalseNegatives is the property that makes a Signature usable
-// as a filter: whenever a really contains b, the signatures must agree. The
-// converse is allowed to be wrong, and at width 64 with this key pool it
-// regularly is, so it is only counted.
-func TestSignatureNoFalseNegatives(t *testing.T) {
-	next := randMaps(5)
-	for _, bitWidth := range []uint{64, 1024} {
-		falsePositives := 0
-		for i := 0; i < 10000; i++ {
-			am, bm := next(), next()
-			a, b := sigOfKeys(bitWidth, am), sigOfKeys(bitWidth, bm)
-			got, want := a.Contains(b), containsAllKeys(am, bm)
-			if want && !got {
-				t.Fatalf("width %d: signature of %v does not contain signature of %v, but the key set does",
-					bitWidth, keysOf(am), keysOf(bm))
-			}
-			if got && !want {
-				falsePositives++
-			}
+// TestSignatureBitsAreReachable pins bitMask to the signature's width: every
+// offset it can produce must set a bit, and between them they must cover the
+// whole signature.
+func TestSignatureBitsAreReachable(t *testing.T) {
+	var all, want sig.Fixed
+	for i := range want {
+		want[i] = ^uint64(0)
+	}
+	for bit := uint(0); bit <= uint(bitMask); bit++ {
+		var s sig.Fixed
+		s.Set(bit)
+		if (s == sig.Fixed{}) {
+			t.Fatalf("Set(%d) set no bit: bitMask is wider than the signature", bit)
 		}
-		t.Logf("width %d: %d/10000 false positives", bitWidth, falsePositives)
-	}
-}
-
-// sigOfKeys builds a Signature over the keys of m.
-func sigOfKeys(bitWidth uint, m map[string]string) *Signature {
-	return NewSignature(bitWidth, keysOf(m)...)
-}
-
-func keysOf(m map[string]string) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	return keys
-}
-
-// containsAllKeys is the obvious reference implementation of key containment.
-func containsAllKeys(a, b map[string]string) bool {
-	for k := range b {
-		if _, ok := a[k]; !ok {
-			return false
+		for i := range all {
+			all[i] |= s[i]
 		}
 	}
-	return true
-}
-
-func benchSignature(bitWidth uint, n int) *Signature {
-	keys := make([]string, n)
-	for i := range keys {
-		keys[i] = fmt.Sprintf("key-%04d", i)
+	if all != want {
+		t.Errorf("bits reachable through bitMask = %#x, want %#x: bitMask is narrower than the signature", all, want)
 	}
-	return NewSignature(bitWidth, keys...)
 }
 
-func BenchmarkSignatureContains(b *testing.B) {
-	for _, bitWidth := range []uint{64, 1024, 65536} {
-		big := benchSignature(bitWidth, 64)
-		hit := NewSignature(bitWidth, "key-0016", "key-0017")
-		miss := NewSignature(bitWidth, "key-1000", "key-1001")
-		if !big.Contains(hit) {
-			b.Fatalf("width %d: benchmark inputs are wrong", bitWidth)
+// TestSignatureRejectionRate reports the share of absent keys that ksig rejects
+// outright, which is what BenchmarkContainsKeysSaturation is timing the
+// consequences of. It asserts only the direction, as the rate depends on the
+// hash; the numbers it logs are the useful part.
+func TestSignatureRejectionRate(t *testing.T) {
+	probes := make([]string, 4096)
+	for i := range probes {
+		probes[i] = fmt.Sprintf("absent-%06d", i)
+	}
+
+	var prev float64 = 1
+	for _, n := range []int{8, 16, 32, 64, 128, 256, 1024} {
+		set := benchSet(n)
+		rejected := 0
+		for _, p := range probes {
+			var probeSig sig.Fixed
+			probeSig.Set(makeKV(p, "").kbit())
+			if !set.ksig.Contains(probeSig) {
+				rejected++
+			}
 		}
-		b.Run(fmt.Sprintf("bits=%d/hit", bitWidth), func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
-				if !big.Contains(hit) {
-					b.Fatal("want contains")
-				}
-			}
-		})
-		b.Run(fmt.Sprintf("bits=%d/miss", bitWidth), func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
-				big.Contains(miss)
-			}
-		})
+		rate := float64(rejected) / float64(len(probes))
+		t.Logf("n=%4d: ksig rejects %5.1f%% of absent keys (expected %5.1f%%)",
+			n, 100*rate, 100*math.Pow(1-1/float64(sig.FixedBits), float64(n)))
+		if rate > prev {
+			t.Errorf("n=%d: rejection rate %.3f rose above %.3f; the gate should only decay as the set fills", n, rate, prev)
+		}
+		prev = rate
 	}
 }

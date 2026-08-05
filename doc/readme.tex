@@ -19,7 +19,8 @@ subset queries without touching the elements. \code{pred} builds on it: a
 label-selector style predicate that is compiled once and matched many times.
 Both trade construction cost for match cost, on the assumption that a set or a
 predicate is built once and queried repeatedly. They live at
-\code{github.com/bowei/kvec/pkg/kv} and \code{github.com/bowei/kvec/pkg/pred}.
+\code{github.com/bowei/kvec/pkg/kv} and \code{github.com/bowei/kvec/pkg/pred},
+over the signatures in \code{.../pkg/sig} and the hash in \code{.../pkg/fnv}.
 \end{abstract}
 
 \section{\code{kv}}
@@ -45,8 +46,10 @@ predicate is built once and queried repeatedly. They live at
     whether such a pair exists.
 \end{description}
 
-\paragraph{\code{Signature}} A standalone, dynamically sized approximation of
-set containment over plain strings.
+\paragraph{\code{sig.Signature}} A standalone, dynamically sized approximation
+of set containment over plain strings. It lives in \code{pkg/sig} alongside
+\code{sig.Fixed}, the compile-time sized vector \code{KV} embeds; \code{kv}
+depends on that package rather than the other way round.
 
 \begin{description}
   \item[\code{NewSignature(bitWidth uint, keys ...string) *Signature}] rounds
@@ -69,16 +72,17 @@ signature therefore rejects with certainty and accepts only provisionally.
 \subsection{Internal optimizations}
 
 \paragraph{Fixed-width signatures as a rejection gate.} Every \code{KV} carries
-two \code{sigLen}$\,\times\,64$-bit vectors built at construction: \code{ksig}
+two \code{sig.Fixed} vectors of \code{sig.FixedBits}${}=128$ bits, built at
+construction: \code{ksig}
 over the key hashes, and \code{kvsig} over the key hashes mixed with the value
 hashes. \code{Contains} tests \code{other}'s bits against the receiver's with
 \code{\&\^{}}; any bit present in \code{other} and absent in the receiver proves
 a pair the receiver cannot hold, and rejects before a single element is read.
 Both vectors are checked. This is not redundant: the two fold different hashes
 into the same width, so a pair missing from one can collide in the other, and at
-\code{sigLen}${}=2$ both vectors sit in the cache line already fetched. The
+two words apiece both vectors sit in the cache line already fetched. The
 fixed width lets the loops be unrolled and keeps the vector inline in the
-struct, where the dynamic \code{Signature} would cost an allocation and an
+struct, where the dynamic \code{sig.Signature} would cost an allocation and an
 unrollable loop.
 
 \paragraph{Hash-ordered storage.} Pairs are sorted once at construction by
@@ -105,9 +109,17 @@ one-bit signature for the probe key and test it against \code{ksig} before
 searching. A missing key is usually rejected on a bit operation instead of a
 binary search.
 
-\paragraph{Allocation-free hashing.} \code{fnv1a64} is written out inline rather
-than through \code{hash.Hash}, avoiding the hash-object allocation on a path
-taken once per key at construction and once per probe at query time.
+\paragraph{Allocation-free hashing.} \code{fnv.Hash64}, in
+\code{github.com/bowei/kvec/pkg/fnv}, folds bytes into a plain \code{uint64}
+rather than going through \code{hash.Hash}, on a path taken once per key at
+construction and once per probe at query time. Both \code{kv} and \code{sig}
+hash through it. The hash-object allocation this is meant to avoid does not in
+fact appear at a call site simple enough for the compiler to inline
+\code{New64a} and keep the object on the stack, and
+\code{BenchmarkStdlibHash64} measures the two within noise of each other on a
+twelve-byte key. What the package buys is a function returning a \code{uint64}
+that can be resumed with \code{Add64} and \code{AddWord64}, which is what
+\code{KV.Hash} folds its pairs with.
 
 \paragraph{Power-of-two widths.} Both signature types require a power-of-two bit
 width, so folding a hash to a bit offset is a mask (\code{hash \& bitMask})
@@ -273,7 +285,7 @@ $4.7$\,ms, so on this shape the gallop is around $290\times$ ahead. The
 diagonal, where the two sides are the same size and the gallop never triggers,
 runs at about $4.7$\,ns per pair.
 
-\subsection{\code{kv.Signature}}
+\subsection{\code{sig.Signature}}
 
 \begin{table}[h]
 \centering
@@ -291,14 +303,14 @@ miss & 1.4 & 2.9 &  92.4 \\
 
 Cost is linear in the number of words, since a hit has to read all of them; a
 miss is cheaper because the loop returns at the first word that fails. This is
-the argument for the inline fixed-width signature inside \code{KV}: at
-\code{sigLen}${}=2$ the whole test is the $1.4$--$1.9$\,ns line of
-Table~\ref{tab:sig}, with no allocation and no loop.
+the argument for the inline \code{sig.Fixed} inside \code{KV}: at two words the
+whole test is the $1.4$--$1.9$\,ns line of Table~\ref{tab:sig}, with no
+allocation and no loop.
 
 \subsection{Where the signature gate stops paying}
 
 The gate is only worth what it rejects, and what it rejects decays as the set
-fills it. A \code{KV} carries $64 \times \code{sigLen} = 128$ bits, so a set of
+fills it. A \code{KV} carries \code{sig.FixedBits}${} = 128$ bits, so a set of
 $n$ keys leaves a fraction of about
 \[
   \left(1 - \frac{1}{128}\right)^{n}
@@ -328,10 +340,10 @@ formula to within a few points.}
 The cost of a missing key rises from $12.8$ to $50.6$\,ns as the gate goes from
 rejecting almost everything to rejecting nothing, at which point every probe
 pays for the binary search the signature exists to avoid. This is the
-quantitative form of the note in the source that \code{sigLen} suits sets of far
-fewer than a thousand pairs: the gate is worth having up to a hundred or so
+quantitative form of the note in the source that \code{sig.Fixed} suits sets of
+far fewer than a thousand pairs: the gate is worth having up to a hundred or so
 pairs, is half wasted by $128$, and is dead weight by $1024$. A set expected to
-run large wants a larger \code{sigLen}, at two words of overhead per doubling.
+run large wants a wider \code{sig.Fixed}, at two words of overhead per doubling.
 
 Note that the single figure in Table~\ref{tab:kv} --- a $6.0$\,ns
 \code{ContainsKeys} miss at 64 pairs --- is one key that happened to land on a

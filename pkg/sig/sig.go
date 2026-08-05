@@ -1,8 +1,18 @@
-package kv
+// Package sig provides bit-vector signatures: one-sided approximations of the
+// Contains operation on a set of strings. A signature answers "other cannot be
+// a subset" exactly and "other may be a subset" approximately, which makes it a
+// cheap gate in front of an exact check.
+//
+// Fixed is sized at compile time and lives inline in the caller's struct.
+// Signature is sized per instance, at the cost of an allocation and a loop the
+// compiler cannot unroll.
+package sig
 
 import (
 	"fmt"
 	"math/bits"
+
+	"github.com/bowei/kvec/pkg/fnv"
 )
 
 const (
@@ -30,7 +40,7 @@ func NewSignature(bitWidth uint, keys ...string) *Signature {
 	sig := Signature{bitWidth: sigBits(bitWidth)}
 	sig.words = make([]uint64, sig.bitWidth/64)
 	for _, k := range keys {
-		sig.set(fnv1a64([]byte(k)))
+		sig.set(fnv.Hash64([]byte(k)))
 	}
 	return &sig
 }
@@ -59,9 +69,9 @@ func sigBits(bitWidth uint) uint {
 //
 // Signature.Contains can only be peformed on equal bitwidths.
 //
-// This is the dynamically sized counterpart of fixedSig: the width is chosen
+// This is the dynamically sized counterpart of Fixed: the width is chosen
 // per instance rather than at compile time, at the cost of an allocation and a
-// loop that the compiler cannot unroll. Prefer fixedSig where the width is
+// loop that the compiler cannot unroll. Prefer Fixed where the width is
 // known and small.
 //
 // The zero Signature is an empty signature of width zero. It contains only
