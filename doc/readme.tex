@@ -47,9 +47,9 @@ over the signatures in \code{.../pkg/sig} and the hash in \code{.../pkg/fnv}.
 \end{description}
 
 \paragraph{\code{sig.Signature}} A standalone, dynamically sized approximation
-of set containment over plain strings. It lives in \code{pkg/sig} alongside
-\code{sig.Fixed}, the compile-time sized vector \code{KV} embeds; \code{kv}
-depends on that package rather than the other way round.
+of set containment over plain strings. It lives in \code{pkg/sig} alongside the
+compile-time sized vectors described below, one of which \code{KV} embeds;
+\code{kv} depends on that package rather than the other way round.
 
 \begin{description}
   \item[\code{NewSignature(bitWidth uint, keys ...string) *Signature}] rounds
@@ -62,7 +62,28 @@ depends on that package rather than the other way round.
   \item[\code{(*Signature) Equal(other *Signature) bool}] same width, same bits.
 \end{description}
 
-The guarantee is one-sided. For string sets $A, B$ with signatures $S_A, S_B$:
+\paragraph{\code{sig.Fixed64}, \code{sig.Fixed128}, \code{sig.Fixed256}} The
+compile-time sized counterparts, of $64$, $128$ and $256$ bits respectively.
+The width is in the type name, so the loops are unrolled and the vector sits
+inline in the caller's struct instead of behind a slice header. The three share
+one interface, with \code{N} standing for the width:
+
+\begin{description}
+  \item[\code{(*FixedN) Set(bit uint)}] sets the bit at an offset. Offsets at or
+    above \code{FixedNBits} are dropped silently, so callers fold their hashes
+    with \code{FixedNBits}${}-1$.
+  \item[\code{(*FixedN) Contains(other FixedN) bool}] whether every bit set in
+    \code{other} is also set in the receiver.
+  \item[\code{(*FixedN) Equal(other FixedN) bool}] the same bits set.
+\end{description}
+
+The zero value is the empty signature, which every vector of that width
+contains. Unlike \code{Signature}, whose mismatched widths panic at the call,
+the widths here are distinct types that never meet: the choice is made once,
+where the field is declared, and the compiler holds it.
+
+The guarantee is one-sided, for the fixed vectors and \code{Signature} alike.
+For string sets $A, B$ with signatures $S_A, S_B$:
 \[
   A \supseteq B \implies S_A.\mathrm{Contains}(S_B),
 \]
@@ -72,8 +93,8 @@ signature therefore rejects with certainty and accepts only provisionally.
 \subsection{Internal optimizations}
 
 \paragraph{Fixed-width signatures as a rejection gate.} Every \code{KV} carries
-two \code{sig.Fixed} vectors of \code{sig.FixedBits}${}=128$ bits, built at
-construction: \code{ksig}
+two \code{sig.Fixed128} vectors of \code{sig.Fixed128Bits}${}=128$ bits, built
+at construction: \code{ksig}
 over the key hashes, and \code{kvsig} over the key hashes mixed with the value
 hashes. \code{Contains} tests \code{other}'s bits against the receiver's with
 \code{\&\^{}}; any bit present in \code{other} and absent in the receiver proves
@@ -121,7 +142,7 @@ twelve-byte key. What the package buys is a function returning a \code{uint64}
 that can be resumed with \code{Add64} and \code{AddWord64}, which is what
 \code{KV.Hash} folds its pairs with.
 
-\paragraph{Power-of-two widths.} Both signature types require a power-of-two bit
+\paragraph{Power-of-two widths.} Every signature type has a power-of-two bit
 width, so folding a hash to a bit offset is a mask (\code{hash \& bitMask})
 rather than a division. \code{Signature.Contains} reslices the other side to the
 receiver's length so the bounds-check eliminator can drop the checks in the
@@ -303,15 +324,15 @@ miss & 1.4 & 2.9 &  92.4 \\
 
 Cost is linear in the number of words, since a hit has to read all of them; a
 miss is cheaper because the loop returns at the first word that fails. This is
-the argument for the inline \code{sig.Fixed} inside \code{KV}: at two words the
+the argument for the inline \code{sig.Fixed128} inside \code{KV}: at two words the
 whole test is the $1.4$--$1.9$\,ns line of Table~\ref{tab:sig}, with no
 allocation and no loop.
 
 \subsection{Where the signature gate stops paying}
 
 The gate is only worth what it rejects, and what it rejects decays as the set
-fills it. A \code{KV} carries \code{sig.FixedBits}${} = 128$ bits, so a set of
-$n$ keys leaves a fraction of about
+fills it. A \code{KV} carries \code{sig.Fixed128Bits}${} = 128$ bits, so a set
+of $n$ keys leaves a fraction of about
 \[
   \left(1 - \frac{1}{128}\right)^{n}
 \]
@@ -340,14 +361,56 @@ formula to within a few points.}
 The cost of a missing key rises from $12.8$ to $50.6$\,ns as the gate goes from
 rejecting almost everything to rejecting nothing, at which point every probe
 pays for the binary search the signature exists to avoid. This is the
-quantitative form of the note in the source that \code{sig.Fixed} suits sets of
-far fewer than a thousand pairs: the gate is worth having up to a hundred or so
-pairs, is half wasted by $128$, and is dead weight by $1024$. A set expected to
-run large wants a wider \code{sig.Fixed}, at two words of overhead per doubling.
+quantitative form of the note in the source that \code{sig.Fixed128} suits sets
+of far fewer than a thousand pairs: the gate is worth having up to a hundred or
+so pairs, is half wasted by $128$, and is dead weight by $1024$.
 
 Note that the single figure in Table~\ref{tab:kv} --- a $6.0$\,ns
 \code{ContainsKeys} miss at 64 pairs --- is one key that happened to land on a
 clear bit. Table~\ref{tab:sat} gives the honest average for that size, $16.4$\,ns.
+
+\subsection{Choosing the width}
+
+\code{sig.Fixed64} and \code{sig.Fixed256} are the same structure at half and
+twice the bits, costing one word less and two words more per vector. The
+formula above depends on $n$ and the width only through their ratio, so
+doubling the width shifts the whole decay curve one column to the right of
+Table~\ref{tab:sat}, whose columns are powers of two.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrrrrr}
+\hline
+pairs in the set & 8 & 16 & 32 & 64 & 128 & 256 & 1024 \\
+\hline
+\code{Fixed64}  & 88.2\% & 77.7\% & 60.4\% & 36.5\% & 13.3\% &  1.8\% & 0.0\% \\
+\code{Fixed128} & 93.9\% & 88.2\% & 77.8\% & 60.5\% & 36.6\% & 13.4\% & 0.0\% \\
+\code{Fixed256} & 96.9\% & 93.9\% & 88.2\% & 77.8\% & 60.6\% & 36.7\% & 1.8\% \\
+\hline
+\end{tabular}
+\caption{Predicted share of absent keys the gate rejects, by width. Each row is
+the one above it shifted by a column: a doubling of the width buys a doubling of
+the set size at which the gate still pays.}
+\label{tab:widths}
+\end{table}
+
+Table~\ref{tab:widths} is predicted, not measured. Only the \code{Fixed128} row has been
+measured --- it is the formula row of Table~\ref{tab:sat}, which tracked the
+observed rate to within a few points --- and \code{KV} still embeds that width,
+so every figure elsewhere in this section stands unchanged. What the other two
+rows say is where the choice moves the cliff, not what it costs.
+
+The cost side is the other half of it. A wider vector makes the gate itself
+slower, since a hit has to read every word, and Table~\ref{tab:sig} puts that
+growth at roughly linear in words. Four words is still a handful of
+instructions over data already inline in the struct, and it is bounded above by
+the dynamic \code{Signature} figures there, which pay for a slice header and an
+unrollable loop on top. The trade is therefore a few extra instructions on
+every gate against a binary search avoided on the misses the narrower vector
+would have let through, which is worth taking only where the sets really do run
+large. A \code{KV} known to hold a handful of pairs can go the other way and
+take \code{Fixed64}, keeping most of the gate --- $88.2\%$ at eight pairs
+against $93.9\%$ --- for one word instead of two.
 
 \subsection{\code{pred}}
 
